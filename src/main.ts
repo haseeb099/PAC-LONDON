@@ -1,6 +1,12 @@
 import 'maplibre-gl/dist/maplibre-gl.css'
 import './style.css'
 import { SynthAudio } from './audio/synthAudio'
+import {
+  getBoroughFeature,
+  getFeatureBounds,
+  loadLondonBoroughs,
+  LOCKED_BOROUGH_NAME,
+} from './data/londonBoroughs'
 import { fetchRoadData, loadAddressPresets, searchPlaces } from './data/overpass'
 import { GameEngine } from './game/gameEngine'
 import { generatePlayableMap } from './generator/generatePlayableMap'
@@ -116,9 +122,33 @@ app.innerHTML = `
       <div id="map"></div>
       <div class="overlay">
         <canvas id="game-canvas"></canvas>
-        <div id="loading-indicator" class="loading-indicator hidden">
-          <div class="loading-spinner" aria-hidden="true"></div>
-          <div id="loading-text"></div>
+        <div id="loading-indicator" class="loading-indicator hidden" aria-live="polite">
+          <div class="loading-card">
+            <p class="loading-eyebrow" id="loading-eyebrow"></p>
+            <h2 id="loading-title"></h2>
+            <p class="loading-tagline" id="loading-tagline"></p>
+            <div class="loading-spinner" aria-hidden="true"></div>
+            <p id="loading-text" class="loading-status"></p>
+            <div class="loading-progress" aria-hidden="true">
+              <div id="loading-progress-bar" class="loading-progress-bar"></div>
+            </div>
+            <ul class="loading-steps" id="loading-steps">
+              <li id="loading-step-map" data-step="map"></li>
+              <li id="loading-step-roads" data-step="roads"></li>
+              <li id="loading-step-houses" data-step="houses"></li>
+              <li id="loading-step-ready" data-step="ready"></li>
+            </ul>
+            <div class="loading-info">
+              <p id="loading-how-title" class="loading-info-title"></p>
+              <ol id="loading-how-list" class="loading-how-list"></ol>
+              <p id="loading-stack" class="loading-stack"></p>
+            </div>
+          </div>
+        </div>
+        <div id="borough-banner" class="borough-banner" aria-live="polite">
+          <p id="borough-banner-title" class="borough-banner-title"></p>
+          <p id="borough-banner-body" class="borough-banner-body"></p>
+          <button id="borough-confirm-button" type="button" class="primary borough-confirm hidden"></button>
         </div>
         <div id="message" class="message"></div>
       </div>
@@ -161,8 +191,33 @@ const tipControls = requireElement<HTMLElement>('#tip-controls')
 const tipHouses = requireElement<HTMLElement>('#tip-houses')
 const tipGenerate = requireElement<HTMLElement>('#tip-generate')
 const loadingIndicator = requireElement<HTMLDivElement>('#loading-indicator')
-const loadingText = requireElement<HTMLDivElement>('#loading-text')
+const loadingEyebrow = requireElement<HTMLElement>('#loading-eyebrow')
+const loadingTitle = requireElement<HTMLElement>('#loading-title')
+const loadingTagline = requireElement<HTMLElement>('#loading-tagline')
+const loadingText = requireElement<HTMLElement>('#loading-text')
+const loadingProgressBar = requireElement<HTMLDivElement>('#loading-progress-bar')
+const loadingStepMap = requireElement<HTMLElement>('#loading-step-map')
+const loadingStepRoads = requireElement<HTMLElement>('#loading-step-roads')
+const loadingStepHouses = requireElement<HTMLElement>('#loading-step-houses')
+const loadingStepReady = requireElement<HTMLElement>('#loading-step-ready')
+const loadingHowTitle = requireElement<HTMLElement>('#loading-how-title')
+const loadingHowList = requireElement<HTMLOListElement>('#loading-how-list')
+const loadingStack = requireElement<HTMLElement>('#loading-stack')
+const boroughBanner = requireElement<HTMLDivElement>('#borough-banner')
+const boroughBannerTitle = requireElement<HTMLElement>('#borough-banner-title')
+const boroughBannerBody = requireElement<HTMLElement>('#borough-banner-body')
+const boroughConfirmButton = requireElement<HTMLButtonElement>('#borough-confirm-button')
 const message = requireElement<HTMLDivElement>('#message')
+
+type LoadingStep = 'map' | 'roads' | 'houses' | 'ready'
+
+const LOADING_STEP_ORDER: LoadingStep[] = ['map', 'roads', 'houses', 'ready']
+const LOADING_STEP_NODES: Record<LoadingStep, HTMLElement> = {
+  map: loadingStepMap,
+  roads: loadingStepRoads,
+  houses: loadingStepHouses,
+  ready: loadingStepReady,
+}
 const mapRoot = requireElement<HTMLDivElement>('#map')
 const canvas = requireElement<HTMLCanvasElement>('#game-canvas')
 
@@ -178,6 +233,9 @@ let currentMessage: { key: string; params?: Record<string, string | number> } = 
 let addressPresets: AddressPreset[] = []
 let movedMessageTimer: number | null = null
 let isGenerating = false
+let selectedBorough: string | null = null
+let boroughIntroActive = true
+let pendingBoroughCollection: Awaited<ReturnType<typeof loadLondonBoroughs>> | null = null
 
 function setText(node: HTMLElement, text: string): void {
   if (node.textContent !== text) {
@@ -200,12 +258,126 @@ function setMessageKey(key: string, params?: Record<string, string | number>): v
   setText(message, t(key, params))
 }
 
+function renderLoadingCopy(): void {
+  setText(loadingEyebrow, t('loading.eyebrow'))
+  setText(loadingTitle, t('loading.title'))
+  setText(loadingTagline, t('loading.tagline'))
+  setText(loadingHowTitle, t('loading.howTitle'))
+  setText(loadingStack, t('loading.stack'))
+  setText(loadingStepMap, t('loading.step.map'))
+  setText(loadingStepRoads, t('loading.step.roads'))
+  setText(loadingStepHouses, t('loading.step.houses'))
+  setText(loadingStepReady, t('loading.step.ready'))
+  loadingHowList.innerHTML = [
+    t('loading.how.1'),
+    t('loading.how.2'),
+    t('loading.how.3'),
+    t('loading.how.4'),
+  ].map((item) => `<li>${item}</li>`).join('')
+}
+
+function setLoadingStep(step: LoadingStep, statusKey: string): void {
+  const index = LOADING_STEP_ORDER.indexOf(step)
+  loadingProgressBar.style.width = `${((index + 1) / LOADING_STEP_ORDER.length) * 100}%`
+  setText(loadingText, t(statusKey))
+  for (const [key, node] of Object.entries(LOADING_STEP_NODES) as Array<[LoadingStep, HTMLElement]>) {
+    const stepIndex = LOADING_STEP_ORDER.indexOf(key)
+    node.classList.toggle('is-active', key === step)
+    node.classList.toggle('is-done', stepIndex < index)
+  }
+}
+
 function setGenerating(active: boolean): void {
   isGenerating = active
   loadingIndicator.classList.toggle('hidden', !active)
-  generateButton.disabled = active
-  loadingText.textContent = t('loading.overlay')
+  playButton.disabled = active
+  if (active) {
+    renderLoadingCopy()
+    setLoadingStep('map', 'loading.status.map')
+  } else {
+    loadingProgressBar.style.width = '0%'
+  }
   updateGenerateButtonHint()
+}
+
+function renderBoroughBanner(): void {
+  if (loadingIndicator.classList.contains('hidden') === false && isGenerating) {
+    boroughBanner.classList.add('hidden')
+    return
+  }
+
+  boroughBanner.classList.remove('hidden')
+  if (selectedBorough === LOCKED_BOROUGH_NAME) {
+    setText(boroughBannerTitle, t('borough.selectedTitle', { name: LOCKED_BOROUGH_NAME }))
+    setText(boroughBannerBody, t('borough.selectedBody', { name: LOCKED_BOROUGH_NAME }))
+    boroughConfirmButton.classList.add('hidden')
+    return
+  }
+
+  setText(boroughBannerTitle, t('borough.pickTitle'))
+  setText(boroughBannerBody, t('borough.pickBody', { name: LOCKED_BOROUGH_NAME }))
+  setText(boroughConfirmButton, t('borough.confirm', { name: LOCKED_BOROUGH_NAME }))
+  boroughConfirmButton.classList.remove('hidden')
+}
+
+function setLocationControlsEnabled(enabled: boolean): void {
+  searchInput.disabled = !enabled
+  searchButton.disabled = !enabled
+  presetSelect.disabled = !enabled
+}
+
+function selectTowerHamlets(): void {
+  if (!pendingBoroughCollection) {
+    return
+  }
+
+  const feature = getBoroughFeature(pendingBoroughCollection, LOCKED_BOROUGH_NAME)
+  if (!feature) {
+    setMessageKey('message.boroughMissing', { name: LOCKED_BOROUGH_NAME })
+    return
+  }
+
+  selectedBorough = LOCKED_BOROUGH_NAME
+  boroughIntroActive = false
+  mapController.fitBounds(getFeatureBounds(feature), { maxZoom: 13.6, duration: 1100, padding: 48 })
+  setLocationControlsEnabled(false)
+  renderBoroughBanner()
+  setMessageKey('message.boroughSelected', { name: LOCKED_BOROUGH_NAME })
+  updateGenerateButtonHint()
+}
+
+function handleBoroughClick(name: string): void {
+  if (selectedBorough) {
+    return
+  }
+
+  if (name !== LOCKED_BOROUGH_NAME) {
+    setMessageKey('message.boroughLocked', { name, locked: LOCKED_BOROUGH_NAME })
+    return
+  }
+
+  selectTowerHamlets()
+}
+
+async function startBoroughIntro(): Promise<void> {
+  setLocationControlsEnabled(false)
+  generateButton.disabled = true
+  renderBoroughBanner()
+  setMessageKey('message.boroughIntro')
+
+  try {
+    pendingBoroughCollection = await loadLondonBoroughs()
+    await mapController.showBoroughIntro(pendingBoroughCollection, handleBoroughClick)
+    setMessageKey('message.boroughReady', { name: LOCKED_BOROUGH_NAME })
+  } catch (error) {
+    console.error('Borough intro failed', error)
+    setMessageKey('message.boroughLoadFailed')
+    selectedBorough = LOCKED_BOROUGH_NAME
+    boroughIntroActive = false
+    setLocationControlsEnabled(false)
+    boroughBanner.classList.add('hidden')
+    updateGenerateButtonHint()
+  }
 }
 
 function setMovedMessage(label: string, zoom: number): void {
@@ -259,11 +431,20 @@ function scheduleMovedMessage(label: string): void {
 
 function updateGenerateButtonHint(): void {
   if (isGenerating) {
+    generateButton.disabled = true
     setText(generateButton, `⏳ ${t('buttons.generate')}`)
     generateButton.title = t('message.loading')
     return
   }
 
+  if (!selectedBorough) {
+    generateButton.disabled = true
+    setText(generateButton, t('buttons.generate'))
+    generateButton.title = t('borough.pickBody', { name: LOCKED_BOROUGH_NAME })
+    return
+  }
+
+  generateButton.disabled = false
   const zoom = mapController.getViewport().zoom
   const zoomText = zoom.toFixed(1)
 
@@ -315,8 +496,12 @@ function renderLocale(): void {
   setText(tipControls, t('tips.controls'))
   setText(tipHouses, t('tips.houses'))
   setHtml(tipGenerate, t('tips.generate'))
+  if (!loadingIndicator.classList.contains('hidden')) {
+    renderLoadingCopy()
+  }
+  renderBoroughBanner()
   updateGenerateButtonHint()
-  if (currentMessage.key === 'message.initial' || currentMessage.key.startsWith('message.viewport') || currentMessage.key === 'message.moved') {
+  if (selectedBorough && (currentMessage.key === 'message.initial' || currentMessage.key.startsWith('message.viewport') || currentMessage.key === 'message.moved')) {
     refreshViewportMessage()
   } else {
     setText(message, t(currentMessage.key, currentMessage.params))
@@ -517,13 +702,26 @@ async function handlePresetSelect(): Promise<void> {
 }
 
 async function generateMaze(): Promise<void> {
+  if (!selectedBorough) {
+    setMessageKey('message.boroughNeeded', { name: LOCKED_BOROUGH_NAME })
+    return
+  }
+
   setMessageKey('message.loading')
   setGenerating(true)
   stopLoop()
   audio.setAmbience(false)
+  mapController.clearBoroughLayers()
+  boroughBanner.classList.add('hidden')
   try {
+    setLoadingStep('map', 'loading.status.map')
     const viewport = expandViewportForMaze(mapController.getViewport())
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 180))
+
+    setLoadingStep('roads', 'loading.status.roads')
     const roadData = await fetchRoadData(viewport.bounds)
+
+    setLoadingStep('houses', 'loading.status.houses')
     playableMap = generatePlayableMap(viewport, roadData, {
       pelletDensity: Number(pelletInput.value),
     })
@@ -533,6 +731,10 @@ async function generateMaze(): Promise<void> {
     applySpeed()
     drawCurrentFrame()
     syncHud()
+
+    setLoadingStep('ready', 'loading.status.ready')
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 650))
+
     window.setTimeout(() => {
       mapController.resize()
       if (playableMap) {
@@ -561,12 +763,22 @@ async function play(): Promise<void> {
     setMessageKey('message.generateFirst')
     return
   }
+
+  renderLoadingCopy()
+  loadingIndicator.classList.remove('hidden')
+  setLoadingStep('ready', 'loading.status.start')
+  loadingProgressBar.style.width = '100%'
+  playButton.disabled = true
+  await new Promise<void>((resolve) => window.setTimeout(resolve, 900))
+
   await audio.unlock()
   engine.start()
   audio.setAmbience(true)
   startLoop()
   processEngineEvents()
   syncHud()
+  loadingIndicator.classList.add('hidden')
+  playButton.disabled = false
 }
 
 function pause(): void {
@@ -625,10 +837,14 @@ pelletInput.addEventListener('input', applyPelletDensity)
 presetSelect.addEventListener('change', () => {
   void handlePresetSelect()
 })
+boroughConfirmButton.addEventListener('click', () => {
+  selectTowerHamlets()
+})
 localeSelect.addEventListener('change', () => {
   currentLocale = localeSelect.value === 'zh-TW' ? 'zh-TW' : 'en'
   saveLocale(currentLocale)
   renderLocale()
+  renderBoroughBanner()
 })
 
 window.addEventListener('keydown', (event) => {
@@ -672,13 +888,13 @@ applyPelletDensity()
 renderLocale()
 mapController.onViewChange(() => {
   updateGenerateButtonHint()
-  if (!engine) {
+  if (!engine && selectedBorough && !boroughIntroActive) {
     refreshViewportMessage()
   }
   drawCurrentFrame()
 })
-setViewportGuidanceMessage()
 syncHud()
 requestAnimationFrame(() => {
   syncMapLayout()
 })
+await startBoroughIntro()
